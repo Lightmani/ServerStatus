@@ -1,0 +1,27 @@
+[Unit]
+Description=ServerStatus agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/serverstatus/agent.env
+ExecStart=/usr/local/bin/ss-agent run -key /etc/serverstatus/agent.key
+Restart=always
+RestartSec=5
+# The agent only reads /proc, /sys and its key; it needs no root.
+User=ss-agent
+Group=ss-agent
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target

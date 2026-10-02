@@ -1,0 +1,21 @@
+{
+  "listen": ":8080",
+  "tls_cert": "",
+  "tls_key": "",
+  "max_clock_skew_seconds": 60,
+  "offline_after_seconds": 15,
+  "trust_proxy_headers": false,
+  "show_ip": false,
+  "dashboard": {
+    "username": "",
+    "password": ""
+  },
+  "clients": [
+    {
+      "id": "hk-01",
+      "name": "香港 01",
+      "location": "HK",
+      "public_key": "在客户端执行 ss-agent keygen 得到的公钥"
+    }
+  ]
+}
