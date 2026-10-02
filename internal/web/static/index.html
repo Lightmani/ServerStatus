@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ServerStatus</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%2322a06b'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="wrap top-inner">
+    <h1>ServerStatus</h1>
+    <div class="summary" id="summary" aria-live="polite"></div>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="error" id="error" hidden></div>
+  <div class="table-wrap">
+    <table class="nodes">
+      <thead>
+        <tr>
+          <th class="c-name">节点</th>
+          <th class="c-uptime">在线时间</th>
+          <th class="c-load">负载</th>
+          <th class="c-net">网络 ↓ / ↑</th>
+          <th class="c-traffic">流量 ↓ / ↑</th>
+          <th class="c-bar">CPU</th>
+          <th class="c-bar">内存</th>
+          <th class="c-bar c-disk">硬盘</th>
+        </tr>
+      </thead>
+      <tbody id="nodes"></tbody>
+    </table>
+  </div>
+  <p class="empty" id="empty" hidden>尚未配置任何节点。在服务端 config.json 的 clients 中添加客户端公钥后发送 SIGHUP 或重启。</p>
+</main>
+
+<footer class="wrap foot">
+  <span id="updated"></span>
+</footer>
+</body>
+</html>
