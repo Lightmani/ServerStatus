@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -172,7 +173,14 @@ func TestEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &Server{cfg: cfg, store: store, hub: hub, guard: NewReplayGuard(time.Minute),
+	if err := store.AddPingTarget(PingTargetDef{ID: "sh", Name: "上海电信", Host: "1.2.3.4", CreatedAt: created}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hub.reload(); err != nil {
+		t.Fatal(err)
+	}
+	alerter, _ := NewAlerter(cfg, hub, store)
+	s := &Server{cfg: cfg, store: store, hub: hub, alerter: alerter, guard: NewReplayGuard(time.Minute),
 		reportLim: NewLimiter(30, time.Minute, time.Minute), loginLim: NewLimiter(5, time.Minute, time.Minute)}
 	if err := s.refreshAuth(); err != nil {
 		t.Fatal(err)
@@ -183,24 +191,39 @@ func TestEndToEnd(t *testing.T) {
 	send := func(secret string, rx uint64) int {
 		rep := protocol.Report{Time: time.Now().Unix(),
 			Host:  protocol.HostInfo{Hostname: "<script>x</script>", BootTime: 1000},
-			State: protocol.State{CPU: 42, MemUsed: 512, MemTotal: 1024, NetRx: rx, NetTx: rx / 2}}
+			State: protocol.State{CPU: 42, MemUsed: 512, MemTotal: 1024, NetRx: rx, NetTx: rx / 2},
+			Pings: []protocol.PingResult{
+				{ID: "sh", Sent: 2, Recv: 1, RTTSum: 30, RTTMin: 30, RTTMax: 30},
+				{ID: "not-mine", Sent: 5, Recv: 5, RTTSum: 5},
+			}}
 		body, _ := json.Marshal(rep)
 		req, _ := http.NewRequest(http.MethodPost, ts.URL+protocol.ReportPath, bytes.NewReader(body))
-		protocol.SignRequest(req, protocol.ReportPath, "hk1", secret, body, time.Now())
+		rts, nonce := protocol.SignRequest(req, protocol.ReportPath, "hk1", secret, body, time.Now())
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
-		resp.Body.Close()
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			data, _ := io.ReadAll(resp.Body)
+			if !protocol.VerifyResponse(secret, "hk1", rts, nonce, data, resp.Header.Get(protocol.HeaderSignature)) {
+				t.Fatal("response signature invalid")
+			}
+			var rr protocol.ReportResponse
+			_ = json.Unmarshal(data, &rr)
+			if len(rr.PingTargets) != 1 || rr.PingTargets[0].Host != "1.2.3.4" || rr.PingInterval != 2 {
+				t.Fatalf("report response: %s", data)
+			}
+		}
 		return resp.StatusCode
 	}
 	if c := send("wrong", 1000); c != http.StatusUnauthorized {
 		t.Fatalf("bad secret: %d", c)
 	}
-	if c := send("sekret", 1000); c != http.StatusNoContent {
+	if c := send("sekret", 1000); c != http.StatusOK {
 		t.Fatalf("report: %d", c)
 	}
-	if c := send("sekret", 5000); c != http.StatusNoContent {
+	if c := send("sekret", 5000); c != http.StatusOK {
 		t.Fatalf("report: %d", c)
 	}
 
@@ -211,6 +234,10 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if nodes.Nodes[0].Cycle.Rx != 4000 {
 		t.Fatalf("live cycle rx = %d", nodes.Nodes[0].Cycle.Rx)
+	}
+	pv := nodes.Nodes[0].Pings
+	if len(pv) != 1 || pv[0].Loss == nil || *pv[0].Loss != 50 || *pv[0].Latency != 30 || pv[0].Sent != 4 {
+		t.Fatalf("ping view: %+v", pv)
 	}
 
 	// flush synchronously and check persisted stats
@@ -231,6 +258,11 @@ func TestEndToEnd(t *testing.T) {
 	getJSON(t, ts.URL+"/api/stats?period=month", &all)
 	if len(all.Nodes) != 1 || all.Total["rx"] != 4000 {
 		t.Fatalf("all stats: %+v", all)
+	}
+	var ph PingHistory
+	getJSON(t, ts.URL+"/api/nodes/hk1/ping?range=1h", &ph)
+	if len(ph.T) != 1 || len(ph.Targets) != 1 || *ph.Targets[0].Loss[0] != 50 || *ph.Targets[0].RTT[0] != 30 {
+		t.Fatalf("ping history: %+v", ph)
 	}
 	var h History
 	getJSON(t, ts.URL+"/api/nodes/hk1/history?range=1h", &h)

@@ -7,6 +7,8 @@
 - **长期统计**：分钟级数据保留 7 天，小时级数据默认永久保留；按 **日 / 周 / 月** 统计 CPU、内存、负载、流量、峰值速率和可用率，支持 CSV 导出。
 - **流量周期**：每个节点可设置每月重置日与流量配额，首页直接显示本周期已用流量与进度。
 - **零依赖 Agent**：直接读取 `/proc`，常驻内存约 10 MB；自动处理重启后计数器清零、服务端宕机期间的流量补记、本机时钟偏差。
+- **定向监测**：在服务端统一配置 ping 目标（ICMP 或 `tcp://host:port`），自动下发给各 agent，网页实时显示每台 VPS 到各目标的延迟与丢包率，并保留历史曲线。
+- **告警 + Telegram**：agent 失联超过 5 分钟、或某个定向目标连续 10 分钟每分钟都 100% 丢包时，推送 Telegram 告警，恢复时再推送一次；告警状态持久化，服务端重启不重复、不遗漏。
 
 ## 架构
 
@@ -37,6 +39,8 @@ X-Probe-Signature = hex(HMAC-SHA256(secret, 签名原文))
 4. 同一 IP 鉴权失败 30 次后封禁 10 分钟。
 
 如果 agent 所在机器的时钟有偏差，服务端会在 401 响应中返回自己的时间，agent 会自动补偿并在日志里提示开启 NTP。
+
+服务端的**响应**同样经过签名（绑定到本次请求的时间戳和 nonce），agent 只接受签名正确的配置（如 ping 目标列表）。这样即使走 HTTP，中间人也无法篡改或重放配置，让 agent 去 ping 任意地址。
 
 > HMAC 只保证**身份与完整性**，不提供**加密**。上报内容（负载、流量等）会以明文传输，生产环境建议使用 HTTPS（内置 TLS 或反向代理）。
 
@@ -108,6 +112,11 @@ serverstatus-server [-c config] <command>
   node edit ID [同上参数]     仅修改显式传入的字段
   node secret ID             轮换密钥（旧密钥立即失效）
   node del [-y] ID           删除节点及其全部历史数据
+  node edit ID -alert=false  屏蔽该节点的告警
+  target add -name N -host H [-nodes a,b] [-sort N] [-id ID]   添加定向监测目标
+  target list | edit ID ... | del ID
+  telegram chats             列出给机器人发过消息的会话（获取 chat_id）
+  notify test                发送一条测试告警
   passwd [-clear] [-stdin]   设置 / 清除网页访问密码
   config-example             输出示例配置
   version
@@ -138,6 +147,18 @@ max_clock_skew: 60s
 retention:
   minute_days: 7
   hour_days: 0                 # 0 = 永久
+ping:
+  interval: 2s                 # 每个目标的探测间隔（1s-60s）
+alert:
+  enabled: true
+  offline_after: 5m            # 失联多久告警
+  ping_loss_minutes: 10        # 连续多少个完整分钟 100% 丢包时告警
+  notify_recovery: true        # 恢复时也通知
+telegram:
+  bot_token: ""                # 留空 = 不推送
+  chat_ids: []                 # 例如 [123456789, -1001234567890, "@mychannel"]
+  api_base: "https://api.telegram.org"
+  proxy: ""                    # 例如 socks5://127.0.0.1:1080
 ```
 
 Agent 配置 `/etc/serverstatus/agent.yaml` 见 [deploy/agent.example.yaml](deploy/agent.example.yaml)。流量统计默认排除 `lo`、`docker*`、`veth*`、`br-*` 等虚拟网卡，避免容器流量被重复计算；可通过 `nic_exclude` 自定义。
@@ -163,6 +184,70 @@ location / {
 ```
 
 使用 Nginx 时，在 server.yaml 中设置 `real_ip_header: "X-Real-IP"`，并把 `listen` 改为 `127.0.0.1:8080`。签名针对的是逻辑路径 `/api/report`，即使挂在子路径下（如 `https://example.com/status/`）也能正常工作。
+
+## 定向监测（Ping）
+
+ping 目标在服务端统一管理，agent 每次上报后从签名响应中获取最新目标列表，约 10 秒内自动生效，不需要逐台修改配置：
+
+```bash
+serverstatus-server -c /etc/serverstatus/server.yaml target add -name "上海电信" -host 202.96.209.133
+```
+
+```bash
+serverstatus-server -c /etc/serverstatus/server.yaml target add -name "广州移动" -host tcp://120.196.165.24:80 -nodes hk01,tyo01
+```
+
+`target list`、`target edit ID -host ...` 和 `target del ID` 用于查看和维护目标。
+
+- `-host` 可以是 IP、域名（ICMP echo），也可以是 `tcp://host:port`（TCP 握手耗时，适合屏蔽了 ICMP 的目标）。
+- `-nodes` 限定由哪些节点探测，留空表示所有节点都探测。
+- 探测间隔由 server.yaml 中的 `ping.interval` 控制（默认 2 秒）。agent 把两次上报之间的结果汇总为“发送数 / 收到数 / RTT 总和、最小值、最大值”一并上报，上报失败时这些数据会保留到下一次，不会丢失。
+- 网页首页每个节点下方用彩色标签显示各目标的实时延迟和近 1~2 分钟的丢包率；节点详情页有延迟、丢包率的历史曲线，和其他指标共用 1 小时 ~ 1 年的时间范围。
+
+**ICMP 权限**：普通用户能否发送 ICMP，取决于 `net.ipv4.ping_group_range`。agent 会先尝试无特权的 ping socket，失败后改用 raw socket。安装脚本生成的 systemd 服务只授予 agent `CAP_NET_RAW` 这一项权限，所以无论系统如何设置都能正常 ping。手动运行 agent 时，如果日志出现 `ICMP ping unavailable`，可以执行：
+
+```bash
+sudo setcap cap_net_raw+ep /usr/local/bin/serverstatus-agent
+```
+
+## 告警与 Telegram
+
+| 规则 | 触发条件 | 恢复条件 |
+|---|---|---|
+| 节点失联 | 超过 `alert.offline_after`（默认 5 分钟）没有收到上报 | 重新开始上报 |
+| 定向丢包 | 某目标在最近 `alert.ping_loss_minutes`（默认 10）个**完整分钟**里，每分钟都有探测且全部丢失，当前分钟也没有回包 | 出现任意一次回包 |
+
+几处有意为之的设计：
+
+- **只在状态变化时通知**（触发一次、恢复一次），故障持续期间不会重复刷屏。
+- **离线期间不会误报丢包**：agent 离线的那几分钟没有探测数据，会中断“连续丢包”的判定，所以只会收到一条“失联”告警，不会再附带一堆丢包告警。
+- **重启安全**：告警状态保存在数据库里。服务端重启后不会把仍在持续的故障再发一遍；从启动时刻起还有 `offline_after` 的宽限期，避免服务端自己停机一段时间后，在 agent 还没重连时就把所有节点误报为失联。
+- 删除节点或目标、或用 `node edit ID -alert=false` 屏蔽某个节点时，相关告警会被静默清除，不会发出误导性的“恢复”通知。
+- 当前告警会以红色横幅显示在网页顶部，即使没有配置 Telegram 也能看到。
+
+配置 Telegram：
+
+1. 在 Telegram 里找 [@BotFather](https://t.me/BotFather)，发送 `/newbot` 创建机器人，拿到 bot token。
+2. 给你的机器人发一条任意消息（如果要推送到群组或频道，就把机器人拉进去）。
+3. 把 token 写入 server.yaml 的 `telegram.bot_token`，然后运行下面的命令，列出最近给机器人发过消息的会话及其 chat_id：
+
+   ```bash
+   serverstatus-server -c /etc/serverstatus/server.yaml telegram chats
+   ```
+
+4. 把需要的 ID 填入 `telegram.chat_ids`，用下面的命令发送测试消息：
+
+   ```bash
+   serverstatus-server -c /etc/serverstatus/server.yaml notify test
+   ```
+
+5. 重启服务端使配置生效：
+
+   ```bash
+   sudo systemctl restart serverstatus-server
+   ```
+
+如果服务器在国内无法直连 `api.telegram.org`，可以设置 `telegram.proxy`（支持 `socks5://` 和 `http://`），或者把 `telegram.api_base` 指向你自建的 Bot API 反向代理。日志和错误信息中的 bot token 一律会被替换为 `<token>`。
 
 ## 统计口径
 
@@ -204,7 +289,8 @@ make release VERSION=v1.0.0
 | POST | `/api/report` | Agent 上报（HMAC 鉴权） |
 | GET | `/api/config` | 标题、版本、时区、是否需要登录 |
 | POST | `/api/login` / `/api/logout` | 网页登录 |
-| GET | `/api/nodes` | 全部节点的实时状态与本周期流量 |
+| GET | `/api/nodes` | 全部节点的实时状态、本周期流量、定向监测和当前告警 |
+| GET | `/api/nodes/{id}/ping?range=...` | 各定向目标的延迟 / 丢包历史 |
 | GET | `/api/nodes/{id}/history?range=1h\|6h\|24h\|7d\|30d\|90d\|1y` | 时间序列（列式 JSON） |
 | GET | `/api/nodes/{id}/stats?period=day\|week\|month&count=N` | 单节点最近 N 个周期的统计 |
 | GET | `/api/stats?period=day\|week\|month&offset=N` | 全部节点在某一周期的统计（offset=0 为当前周期） |

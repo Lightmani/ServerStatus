@@ -178,6 +178,9 @@ Group=$SVC_USER
 ExecStart=$BIN_DIR/serverstatus-agent -c $CONF_DIR/agent.yaml
 Restart=always
 RestartSec=5
+# raw ICMP sockets for targeted ping monitoring (only this capability)
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only

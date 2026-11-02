@@ -34,6 +34,7 @@ type Server struct {
 	cfg       *Config
 	store     *Store
 	hub       *Hub
+	alerter   *Alerter
 	guard     *ReplayGuard
 	reportLim *Limiter
 	loginLim  *Limiter
@@ -55,8 +56,20 @@ func Run(ctx context.Context, cfg *Config, version string) error {
 	if err != nil {
 		return err
 	}
+	var notifiers []Notifier
+	tg, err := NewTelegram(cfg.Telegram)
+	if err != nil {
+		return err
+	}
+	if tg != nil {
+		notifiers = append(notifiers, tg)
+	}
+	alerter, err := NewAlerter(cfg, hub, store, notifiers...)
+	if err != nil {
+		return err
+	}
 	s := &Server{
-		cfg: cfg, store: store, hub: hub, version: version,
+		cfg: cfg, store: store, hub: hub, alerter: alerter, version: version,
 		guard:     NewReplayGuard(cfg.MaxClockSkew),
 		reportLim: NewLimiter(30, 10*time.Minute, 10*time.Minute),
 		loginLim:  NewLimiter(5, 15*time.Minute, 15*time.Minute),
@@ -69,6 +82,16 @@ func Run(ctx context.Context, cfg *Config, version string) error {
 	hubDone := make(chan struct{})
 	go func() { hub.Run(hubCtx); close(hubDone) }()
 	go s.maintenance(ctx)
+	alertDone := make(chan struct{})
+	go func() { alerter.Run(hubCtx); close(alertDone) }()
+	tgCtx, tgCancel := context.WithCancel(context.Background())
+	tgDone := make(chan struct{})
+	if tg != nil {
+		go func() { tg.Run(tgCtx); close(tgDone) }()
+		log.Printf("telegram notifications enabled for %d chat(s)", len(cfg.Telegram.ChatIDs))
+	} else {
+		close(tgDone)
+	}
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -103,6 +126,9 @@ func Run(ctx context.Context, cfg *Config, version string) error {
 	// HTTP is drained; now flush buffered metrics.
 	hubCancel()
 	<-hubDone
+	<-alertDone
+	tgCancel() // delivers queued notifications for up to 5s
+	<-tgDone
 	log.Printf("shutdown complete")
 	return serveErr
 }
@@ -156,6 +182,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/nodes", s.view(s.handleNodes))
 	mux.HandleFunc("GET /api/nodes/{id}/history", s.view(s.handleHistory))
 	mux.HandleFunc("GET /api/nodes/{id}/stats", s.view(s.handleNodeStats))
+	mux.HandleFunc("GET /api/nodes/{id}/ping", s.view(s.handlePingHistory))
 	mux.HandleFunc("GET /api/stats", s.view(s.handleStats))
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not found")
@@ -294,7 +321,16 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	// The response carries the agent's configuration; it is signed and bound
+	// to this request's nonce so it cannot be forged or replayed.
+	out, _ := json.Marshal(protocol.ReportResponse{
+		PingTargets:  s.hub.PingTargetsFor(signed.Node),
+		PingInterval: int(s.cfg.Ping.Interval / time.Second),
+	})
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set(protocol.HeaderSignature, protocol.SignResponse(secret, signed.Node, signed.Timestamp, signed.Nonce, out))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(out)
 }
 
 func trunc(s string, n int) string {
@@ -411,9 +447,31 @@ func sortViews(v []NodeView) {
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, hidden bool) {
 	now := time.Now()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"now":   now.Unix(),
-		"nodes": s.hub.Snapshot(now, hidden),
+		"now":    now.Unix(),
+		"nodes":  s.hub.Snapshot(now, hidden),
+		"alerts": s.alerter.Active(hidden),
 	})
+}
+
+func (s *Server) handlePingHistory(w http.ResponseWriter, r *http.Request, hidden bool) {
+	id := r.PathValue("id")
+	if _, ok := s.hub.nodeMeta(id, hidden); !ok {
+		writeErr(w, http.StatusNotFound, "node not found")
+		return
+	}
+	dur, res, step, ok := historyRange(r.URL.Query().Get("range"))
+	if !ok {
+		writeErr(w, http.StatusBadRequest, "range must be one of 1h,6h,24h,7d,30d,90d,1y")
+		return
+	}
+	now := time.Now()
+	from := floorLocal(now.Add(-dur).Unix(), step, s.cfg.Location())
+	rows, err := s.store.QueryPing(id, res, from, now.Unix()+1)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, buildPingHistory(rows, s.hub.targetDefsFor(id), step, s.cfg.Location()))
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request, hidden bool) {

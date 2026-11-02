@@ -3,6 +3,7 @@ module github.com/Lightmani/ServerStatus
 go 1.24.7
 
 require (
+	golang.org/x/net v0.27.0
 	golang.org/x/term v0.22.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.34.5

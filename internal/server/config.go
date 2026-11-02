@@ -26,6 +26,16 @@ type Config struct {
 		MinuteDays int `yaml:"minute_days"`
 		HourDays   int `yaml:"hour_days"`
 	} `yaml:"retention"`
+	Ping struct {
+		Interval time.Duration `yaml:"interval"`
+	} `yaml:"ping"`
+	Alert struct {
+		Enabled         bool          `yaml:"enabled"`
+		OfflineAfter    time.Duration `yaml:"offline_after"`
+		PingLossMinutes int           `yaml:"ping_loss_minutes"`
+		NotifyRecovery  bool          `yaml:"notify_recovery"`
+	} `yaml:"alert"`
+	Telegram TelegramConfig `yaml:"telegram"`
 
 	loc *time.Location
 }
@@ -42,6 +52,12 @@ func DefaultConfig() *Config {
 	}
 	c.Retention.MinuteDays = 7
 	c.Retention.HourDays = 0
+	c.Ping.Interval = 2 * time.Second
+	c.Alert.Enabled = true
+	c.Alert.OfflineAfter = 5 * time.Minute
+	c.Alert.PingLossMinutes = 10
+	c.Alert.NotifyRecovery = true
+	c.Telegram.APIBase = "https://api.telegram.org"
 	return c
 }
 
@@ -107,6 +123,16 @@ func (c *Config) validate() error {
 	if c.Retention.HourDays < 0 {
 		c.Retention.HourDays = 0
 	}
+	c.Ping.Interval = max(time.Second, min(c.Ping.Interval, time.Minute))
+	if c.Alert.OfflineAfter < c.OfflineAfter {
+		c.Alert.OfflineAfter = c.OfflineAfter
+	}
+	if c.Alert.PingLossMinutes < 1 || c.Alert.PingLossMinutes > pingKeepMinutes-1 {
+		return fmt.Errorf("alert.ping_loss_minutes must be between 1 and %d", pingKeepMinutes-1)
+	}
+	if c.Telegram.APIBase == "" {
+		c.Telegram.APIBase = "https://api.telegram.org"
+	}
 	if (c.TLSCert == "") != (c.TLSKey == "") {
 		return errors.New("tls_cert and tls_key must be set together")
 	}
@@ -141,4 +167,21 @@ max_clock_skew: 60s                  # max allowed agent clock drift (replay win
 retention:
   minute_days: 7                     # 1-minute resolution data
   hour_days: 0                       # 1-hour resolution data, 0 = keep forever
+
+# Targeted monitoring: targets are managed with ` + "`serverstatus-server target add`" + `
+# and pushed to agents automatically.
+ping:
+  interval: 2s                       # probe interval per target (1s-60s)
+
+alert:
+  enabled: true
+  offline_after: 5m                  # alert when an agent has not reported for this long
+  ping_loss_minutes: 10              # alert when a target lost 100% in each of the last N minutes
+  notify_recovery: true              # also notify when the problem is resolved
+
+telegram:
+  bot_token: ""                      # from @BotFather; empty = notifications disabled
+  chat_ids: []                       # e.g. [123456789, -1001234567890, "@mychannel"]
+  api_base: "https://api.telegram.org"   # or your own reverse proxy of the Bot API
+  proxy: ""                          # e.g. socks5://127.0.0.1:1080 or http://127.0.0.1:8080
 `

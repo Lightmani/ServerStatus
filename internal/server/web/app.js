@@ -91,6 +91,8 @@ const S = {
   stats: null,
   statsSort: { key: 'total', asc: false },
   history: null,
+  pingHistory: null,
+  alerts: [],
   lastOK: 0,
 };
 
@@ -101,6 +103,22 @@ function bar(p, label, title) {
   p = Math.max(0, Math.min(100, p || 0));
   const cls = p >= 90 ? 'bad' : p >= 75 ? 'warn' : '';
   return `<div class="bar ${cls}"${title ? ` title="${esc(title)}"` : ''}><i style="width:${p.toFixed(1)}%"></i><span>${esc(label ?? fmtPct(p, 0))}</span></div>`;
+}
+
+function pingClass(p) {
+  if (p.loss == null) return 'idle';
+  if (p.loss >= 100) return 'bad';
+  if (p.loss >= 10 || (p.latency ?? 0) >= 300) return 'warn';
+  return 'ok';
+}
+function pingChips(n) {
+  if (!n.pings || !n.pings.length) return '';
+  const chips = n.pings.map((p) => {
+    const lat = p.latency == null ? (p.loss >= 100 ? "超时" : "-") : `${p.latency < 10 ? p.latency.toFixed(1) : Math.round(p.latency)}ms`;
+    const loss = p.loss == null ? '' : ` · ${p.loss < 10 ? p.loss.toFixed(1) : Math.round(p.loss)}%`;
+    return `<span class="chip ${pingClass(p)}" title="${esc(p.host)}"><b>${esc(p.name)}</b> ${lat}${loss}</span>`;
+  }).join('');
+  return `<div class="pings">${chips}</div>`;
 }
 
 function nodeRow(n) {
@@ -128,6 +146,7 @@ function nodeRow(n) {
     <div><span class="lbl">CPU</span>${cpu}</div>
     <div><span class="lbl">内存</span>${mem}</div>
     <div><span class="lbl">硬盘</span>${disk}</div>
+    ${pingChips(n)}
   </div>`;
 }
 
@@ -167,14 +186,27 @@ function renderSummary() {
     ['实时上行', `<span class="up">${fmtRate(tx)}</span>`],
     ['本周期下行', fmtBytes(crx)],
     ['本周期上行', fmtBytes(ctx)],
+    ['活动告警', S.alerts.length ? `<span style="color:var(--bad)">${S.alerts.length}</span>` : '<span style="color:var(--ok)">0</span>'],
   ];
   $('#summary').innerHTML = cards.map(([k, v]) => `<div class="card"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+}
+
+function renderAlerts() {
+  const now = Date.now() / 1000;
+  $('#alerts').innerHTML = S.alerts.map((a) => {
+    const what = a.kind === 'offline'
+      ? `<b>${esc(a.node_name)}</b> 失联`
+      : `<b>${esc(a.node_name)}</b> → <b>${esc(a.target_name)}</b> 丢包 100%`;
+    return `<a class="alert" href="#/node/${encodeURIComponent(a.node_id)}"><span class="dot"></span>${what}<span class="sub">持续 ${fmtDur(now - a.since)} · 自 ${fmtTime(a.since)}</span></a>`;
+  }).join('');
 }
 
 async function refreshNodes() {
   try {
     const data = await api('/api/nodes');
     S.nodes = data.nodes || [];
+    S.alerts = data.alerts || [];
+    renderAlerts();
     S.byId = new Map(S.nodes.map((n) => [n.id, n]));
     S.lastOK = Date.now();
     renderSummary();
@@ -234,6 +266,7 @@ function renderDetailInfo() {
     infoItem('Agent 版本', h.agent_version || '-'),
   );
   $('#d-info').innerHTML = items.join('');
+  renderPingTable(n);
 }
 
 function openDetail(id) {
@@ -245,6 +278,7 @@ function openDetail(id) {
   renderDetailInfo();
   if (changed) {
     S.history = null;
+    S.pingHistory = null;
     loadHistory();
     loadNodeStats();
   }
@@ -262,6 +296,7 @@ const RANGE_SECONDS = { '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800, '30
 async function loadHistory() {
   const id = S.detail;
   if (!id) return;
+  loadPingHistory();
   try {
     const h = await api(`/api/nodes/${encodeURIComponent(id)}/history?range=${S.range}`);
     if (S.detail !== id) return;
@@ -277,6 +312,47 @@ function legend(title, series) {
 }
 
 function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+
+async function loadPingHistory() {
+  const id = S.detail;
+  const n = S.byId.get(id);
+  $('#d-ping').classList.toggle('hidden', !n || !n.pings || !n.pings.length);
+  if (!n || !n.pings || !n.pings.length) return;
+  try {
+    const h = await api(`/api/nodes/${encodeURIComponent(id)}/ping?range=${S.range}`);
+    if (S.detail !== id) return;
+    S.pingHistory = h;
+    drawPingHistory();
+  } catch (e) {
+    if (e instanceof AuthError) showLogin();
+  }
+}
+
+function palette() {
+  return ['--c1', '--c2', '--c3', '--c4', '--c5', '--c6', '--c7', '--c8'].map(cssVar);
+}
+
+function drawPingHistory() {
+  const h = S.pingHistory;
+  if (!h) return;
+  const now = Math.floor(Date.now() / 1000);
+  const pal = palette();
+  const base = { t: h.t, step: h.step, from: now - RANGE_SECONDS[S.range], to: now };
+  const lat = h.targets.map((t, i) => ({ name: t.name, color: pal[i % pal.length], data: t.rtt }));
+  const loss = h.targets.map((t, i) => ({ name: t.name, color: pal[i % pal.length], data: t.loss }));
+  $('#t-rtt').innerHTML = legend('延迟', lat);
+  $('#t-loss').innerHTML = legend('丢包率', loss);
+  drawChart($('#c-rtt'), { ...base, fmt: (v) => `${v < 10 ? v.toFixed(1) : Math.round(v)} ms`, series: lat });
+  drawChart($('#c-loss'), { ...base, max: 100, fmt: (v) => fmtPct(v, 0), series: loss });
+}
+
+function renderPingTable(n) {
+  const el = $('#d-ping-table');
+  if (!n.pings || !n.pings.length) { el.innerHTML = ''; return; }
+  const rows = n.pings.map((p) => `<tr><td><span class="chip ${pingClass(p)}">${esc(p.name)}</span></td><td>${esc(p.host)}</td>
+    <td>${p.latency == null ? '-' : p.latency.toFixed(1) + ' ms'}</td><td>${p.loss == null ? '-' : fmtPct(p.loss)}</td><td>${p.sent || '-'}</td></tr>`).join('');
+  el.innerHTML = `<thead><tr><th>目标</th><th>地址</th><th>实时延迟</th><th>丢包率 (近 1-2 分钟)</th><th>探测次数</th></tr></thead><tbody>${rows}</tbody>`;
+}
 
 function drawHistory() {
   const h = S.history;
@@ -354,23 +430,27 @@ function drawChart(el, opt) {
   const gap = step * 1.5;
   const base = Y(0);
   for (const s of opt.series) {
-    let line = '', area = '', segStart = -1;
-    const closeSeg = (end) => {
-      if (segStart >= 0 && s.fill) area += `L${X(t[end] + step / 2).toFixed(1)},${base}L${X(t[segStart] + step / 2).toFixed(1)},${base}Z`;
+    // null = no data: the line is interrupted instead of dropping to zero
+    let line = '', area = '', segStart = -1, prev = -1;
+    const closeSeg = () => {
+      if (segStart < 0) return;
+      if (s.fill) area += `L${X(t[prev] + step / 2).toFixed(1)},${base}L${X(t[segStart] + step / 2).toFixed(1)},${base}Z`;
+      if (prev === segStart) svg += `<circle cx="${X(t[prev] + step / 2)}" cy="${Y(s.data[prev])}" r="2" fill="${s.color}"/>`;
+      segStart = -1;
     };
     for (let i = 0; i < t.length; i++) {
-      const x = X(t[i] + step / 2).toFixed(1), y = Y(s.data[i] || 0).toFixed(1);
-      const brk = i === 0 || t[i] - t[i - 1] > gap;
-      if (brk) { closeSeg(i - 1); segStart = i; }
+      const v = s.data[i];
+      if (v == null) { closeSeg(); continue; }
+      const x = X(t[i] + step / 2).toFixed(1), y = Y(v).toFixed(1);
+      const brk = segStart < 0 || t[i] - t[prev] > gap;
+      if (brk) { closeSeg(); segStart = i; }
       line += `${brk ? 'M' : 'L'}${x},${y}`;
       area += `${brk ? 'M' : 'L'}${x},${y}`;
+      prev = i;
     }
-    closeSeg(t.length - 1);
-    if (s.fill) svg += `<path d="${area}" fill="${s.color}" fill-opacity="0.12" stroke="none"/>`;
-    svg += `<path d="${line}" fill="none" stroke="${s.color}" stroke-width="1.5" stroke-linejoin="round"/>`;
-    if (t.length === 1 || t.every((_, i) => i === 0 || t[i] - t[i - 1] > gap)) {
-      for (let i = 0; i < t.length; i++) svg += `<circle cx="${X(t[i] + step / 2)}" cy="${Y(s.data[i] || 0)}" r="2" fill="${s.color}"/>`;
-    }
+    closeSeg();
+    if (s.fill && area) svg += `<path d="${area}" fill="${s.color}" fill-opacity="0.12" stroke="none"/>`;
+    if (line) svg += `<path d="${line}" fill="none" stroke="${s.color}" stroke-width="1.5" stroke-linejoin="round"/>`;
   }
   svg += `<line class="cursor" x1="0" x2="0" y1="${pt}" y2="${H - pb}" visibility="hidden"/>`;
   svg += `<rect class="hover" x="${pl}" y="0" width="${W - pl - pr}" height="${H}" fill="transparent"/></svg>`;
@@ -386,7 +466,7 @@ function drawChart(el, opt) {
     if (lo > 0 && Math.abs(t[lo - 1] - tv) < Math.abs(t[lo] - tv)) lo--;
     const cx = X(t[lo] + step / 2);
     cursor.setAttribute('x1', cx); cursor.setAttribute('x2', cx); cursor.setAttribute('visibility', 'visible');
-    const rows = opt.series.map((s) => `<div class="tt-row"><i style="background:${s.color}"></i>${esc(s.name)}：<b>${esc(opt.fmt(s.data[lo] || 0))}</b></div>`).join('');
+    const rows = opt.series.map((s) => `<div class="tt-row"><i style="background:${s.color}"></i>${esc(s.name)}：<b>${s.data[lo] == null ? '-' : esc(opt.fmt(s.data[lo]))}</b></div>`).join('');
     const label = step >= 86400 ? fmtTime(t[lo], 'date') : `${fmtTime(t[lo])}${step > 60 ? ' – ' + fmtTime(t[lo] + step, 'time') : ''}`;
     showTooltip(`<div class="muted">${label}</div>${rows}`, ev.clientX, ev.clientY);
   };
@@ -589,7 +669,7 @@ function bindEvents() {
   let rt;
   window.addEventListener('resize', () => {
     clearTimeout(rt);
-    rt = setTimeout(() => { if (S.detail) drawHistory(); }, 150);
+    rt = setTimeout(() => { if (S.detail) { drawHistory(); drawPingHistory(); } }, 150);
   });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refreshNodes(); });
 }

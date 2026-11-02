@@ -28,6 +28,7 @@ type Node struct {
 	Hidden       bool
 	ResetDay     int    // day of month the traffic cycle resets (1-31)
 	TrafficLimit uint64 // bytes per cycle, 0 = unlimited
+	NoAlert      bool   // suppress alerts for this node
 	CreatedAt    int64
 	HostJSON     string
 	LastSeen     int64
@@ -52,6 +53,7 @@ CREATE TABLE IF NOT EXISTS nodes (
 	hidden        INTEGER NOT NULL DEFAULT 0,
 	reset_day     INTEGER NOT NULL DEFAULT 1,
 	traffic_limit INTEGER NOT NULL DEFAULT 0,
+	no_alert      INTEGER NOT NULL DEFAULT 0,
 	created_at    INTEGER NOT NULL,
 	host_json     TEXT NOT NULL DEFAULT '',
 	last_seen     INTEGER NOT NULL DEFAULT 0,
@@ -84,6 +86,34 @@ CREATE TABLE IF NOT EXISTS metrics (
 	PRIMARY KEY (node_id, res, ts)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS metrics_res_ts ON metrics(res, ts);
+CREATE TABLE IF NOT EXISTS ping_targets (
+	id         TEXT PRIMARY KEY,
+	name       TEXT NOT NULL,
+	host       TEXT NOT NULL,
+	nodes      TEXT NOT NULL DEFAULT '',
+	sort       INTEGER NOT NULL DEFAULT 0,
+	created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ping_metrics (
+	node_id   TEXT NOT NULL,
+	target_id TEXT NOT NULL,
+	res       INTEGER NOT NULL,
+	ts        INTEGER NOT NULL,
+	sent      INTEGER NOT NULL,
+	recv      INTEGER NOT NULL,
+	rtt_sum   REAL NOT NULL,
+	rtt_min   REAL NOT NULL,
+	rtt_max   REAL NOT NULL,
+	PRIMARY KEY (node_id, res, ts, target_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ping_metrics_res_ts ON ping_metrics(res, ts);
+CREATE TABLE IF NOT EXISTS alerts (
+	key        TEXT PRIMARY KEY,
+	kind       TEXT NOT NULL,
+	node_id    TEXT NOT NULL,
+	target_id  TEXT NOT NULL DEFAULT '',
+	since      INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kv (
 	k TEXT PRIMARY KEY,
 	v TEXT NOT NULL
@@ -103,6 +133,10 @@ func OpenStore(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(4)
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
@@ -113,17 +147,43 @@ func OpenStore(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-const nodeCols = `id, name, secret, grp, location, sort, hidden, reset_day, traffic_limit, created_at, host_json, last_seen, last_rx, last_tx, last_boot`
+// migrate upgrades databases created by older versions.
+func migrate(db *sql.DB) error {
+	cols := map[string]bool{}
+	rows, err := db.Query(`PRAGMA table_info(nodes)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt any
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		cols[name] = true
+	}
+	rows.Close()
+	if len(cols) > 0 && !cols["no_alert"] { // table exists but predates alerts
+		if _, err := db.Exec(`ALTER TABLE nodes ADD COLUMN no_alert INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("migrate nodes.no_alert: %w", err)
+		}
+	}
+	return nil
+}
+
+const nodeCols = `id, name, secret, grp, location, sort, hidden, reset_day, traffic_limit, no_alert, created_at, host_json, last_seen, last_rx, last_tx, last_boot`
 
 type scanner interface{ Scan(...any) error }
 
 func scanNode(r scanner) (Node, error) {
 	var n Node
-	var hidden int
+	var hidden, noAlert int
 	var limit, rx, tx int64
 	err := r.Scan(&n.ID, &n.Name, &n.Secret, &n.Group, &n.Location, &n.Sort, &hidden,
-		&n.ResetDay, &limit, &n.CreatedAt, &n.HostJSON, &n.LastSeen, &rx, &tx, &n.LastBoot)
-	n.Hidden = hidden != 0
+		&n.ResetDay, &limit, &noAlert, &n.CreatedAt, &n.HostJSON, &n.LastSeen, &rx, &tx, &n.LastBoot)
+	n.Hidden, n.NoAlert = hidden != 0, noAlert != 0
 	n.TrafficLimit, n.LastRx, n.LastTx = uint64(limit), uint64(rx), uint64(tx)
 	return n, err
 }
@@ -158,9 +218,9 @@ func (s *Store) GetNode(id string) (Node, error) {
 }
 
 func (s *Store) AddNode(n Node) error {
-	_, err := s.db.Exec(`INSERT INTO nodes (id, name, secret, grp, location, sort, hidden, reset_day, traffic_limit, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		n.ID, n.Name, n.Secret, n.Group, n.Location, n.Sort, boolInt(n.Hidden), n.ResetDay, int64(n.TrafficLimit), n.CreatedAt)
+	_, err := s.db.Exec(`INSERT INTO nodes (id, name, secret, grp, location, sort, hidden, reset_day, traffic_limit, no_alert, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		n.ID, n.Name, n.Secret, n.Group, n.Location, n.Sort, boolInt(n.Hidden), n.ResetDay, int64(n.TrafficLimit), boolInt(n.NoAlert), n.CreatedAt)
 	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
 		return fmt.Errorf("node id %q already exists", n.ID)
 	}
@@ -169,8 +229,8 @@ func (s *Store) AddNode(n Node) error {
 
 // UpdateNodeMeta updates the user-editable fields of a node.
 func (s *Store) UpdateNodeMeta(n Node) error {
-	res, err := s.db.Exec(`UPDATE nodes SET name=?, secret=?, grp=?, location=?, sort=?, hidden=?, reset_day=?, traffic_limit=? WHERE id=?`,
-		n.Name, n.Secret, n.Group, n.Location, n.Sort, boolInt(n.Hidden), n.ResetDay, int64(n.TrafficLimit), n.ID)
+	res, err := s.db.Exec(`UPDATE nodes SET name=?, secret=?, grp=?, location=?, sort=?, hidden=?, reset_day=?, traffic_limit=?, no_alert=? WHERE id=?`,
+		n.Name, n.Secret, n.Group, n.Location, n.Sort, boolInt(n.Hidden), n.ResetDay, int64(n.TrafficLimit), boolInt(n.NoAlert), n.ID)
 	if err != nil {
 		return err
 	}
@@ -194,8 +254,10 @@ func (s *Store) DeleteNode(id string) error {
 	if c, _ := res.RowsAffected(); c == 0 {
 		return ErrNotFound
 	}
-	if _, err := tx.Exec(`DELETE FROM metrics WHERE node_id=?`, id); err != nil {
-		return err
+	for _, q := range []string{`DELETE FROM metrics WHERE node_id=?`, `DELETE FROM ping_metrics WHERE node_id=?`, `DELETE FROM alerts WHERE node_id=?`} {
+		if _, err := tx.Exec(q, id); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -238,6 +300,7 @@ type flushJob struct {
 	LastRx   uint64
 	LastTx   uint64
 	LastBoot int64
+	Pings    map[string]PingBucket // target id -> minute bucket
 }
 
 // SaveFlush writes a minute bucket, folds it into the hour bucket and
@@ -258,6 +321,11 @@ func (s *Store) SaveFlush(jobs []flushJob) error {
 		return err
 	}
 	defer upd.Close()
+	pins, err := tx.Prepare(upsertPing)
+	if err != nil {
+		return err
+	}
+	defer pins.Close()
 	for i := range jobs {
 		j := &jobs[i]
 		m := j.Minute
@@ -272,6 +340,14 @@ func (s *Store) SaveFlush(jobs []flushJob) error {
 		}
 		if _, err := upd.Exec(j.HostJSON, j.LastSeen, int64(j.LastRx), int64(j.LastTx), j.LastBoot, j.NodeID); err != nil {
 			return err
+		}
+		for tid, pb := range j.Pings {
+			if _, err := pins.Exec(j.NodeID, tid, ResMinute, m.TS, pb.Sent, pb.Recv, pb.RTTSum, pb.RTTMin, pb.RTTMax); err != nil {
+				return err
+			}
+			if _, err := pins.Exec(j.NodeID, tid, ResHour, h.TS, pb.Sent, pb.Recv, pb.RTTSum, pb.RTTMin, pb.RTTMax); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
@@ -332,7 +408,192 @@ func (s *Store) Cleanup(minuteBefore, hourBefore int64) error {
 			return err
 		}
 	}
-	_, err := s.db.Exec(`DELETE FROM metrics WHERE node_id NOT IN (SELECT id FROM nodes)`)
+	for _, q := range []string{
+		`DELETE FROM metrics WHERE node_id NOT IN (SELECT id FROM nodes)`,
+		`DELETE FROM ping_metrics WHERE node_id NOT IN (SELECT id FROM nodes) OR target_id NOT IN (SELECT id FROM ping_targets)`,
+	} {
+		if _, err := s.db.Exec(q); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`DELETE FROM ping_metrics WHERE res=? AND ts<?`, ResMinute, minuteBefore); err != nil {
+		return err
+	}
+	if hourBefore > 0 {
+		if _, err := s.db.Exec(`DELETE FROM ping_metrics WHERE res=? AND ts<?`, ResHour, hourBefore); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// ping targets & metrics
+
+// PingTargetDef is a monitored destination, probed by all nodes or a subset.
+type PingTargetDef struct {
+	ID        string
+	Name      string
+	Host      string
+	Nodes     []string // empty = all nodes
+	Sort      int
+	CreatedAt int64
+}
+
+// AppliesTo reports whether nodeID should probe this target.
+func (t *PingTargetDef) AppliesTo(nodeID string) bool {
+	if len(t.Nodes) == 0 {
+		return true
+	}
+	for _, n := range t.Nodes {
+		if n == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (s *Store) ListPingTargets() ([]PingTargetDef, error) {
+	rows, err := s.db.Query(`SELECT id, name, host, nodes, sort, created_at FROM ping_targets ORDER BY sort, name, id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PingTargetDef
+	for rows.Next() {
+		var t PingTargetDef
+		var nodes string
+		if err := rows.Scan(&t.ID, &t.Name, &t.Host, &nodes, &t.Sort, &t.CreatedAt); err != nil {
+			return nil, err
+		}
+		t.Nodes = splitList(nodes)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) GetPingTarget(id string) (PingTargetDef, error) {
+	ts, err := s.ListPingTargets()
+	if err != nil {
+		return PingTargetDef{}, err
+	}
+	for _, t := range ts {
+		if t.ID == id {
+			return t, nil
+		}
+	}
+	return PingTargetDef{}, errors.New("ping target not found")
+}
+
+func (s *Store) AddPingTarget(t PingTargetDef) error {
+	_, err := s.db.Exec(`INSERT INTO ping_targets (id, name, host, nodes, sort, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Name, t.Host, strings.Join(t.Nodes, ","), t.Sort, t.CreatedAt)
+	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
+		return fmt.Errorf("target id %q already exists", t.ID)
+	}
+	return err
+}
+
+func (s *Store) UpdatePingTarget(t PingTargetDef) error {
+	_, err := s.db.Exec(`UPDATE ping_targets SET name=?, host=?, nodes=?, sort=? WHERE id=?`,
+		t.Name, t.Host, strings.Join(t.Nodes, ","), t.Sort, t.ID)
+	return err
+}
+
+func (s *Store) DeletePingTarget(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`DELETE FROM ping_targets WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if c, _ := res.RowsAffected(); c == 0 {
+		return errors.New("ping target not found")
+	}
+	if _, err := tx.Exec(`DELETE FROM ping_metrics WHERE target_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM alerts WHERE target_id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+const upsertPing = `INSERT INTO ping_metrics (node_id, target_id, res, ts, sent, recv, rtt_sum, rtt_min, rtt_max)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (node_id, res, ts, target_id) DO UPDATE SET
+	sent = sent + excluded.sent,
+	recv = recv + excluded.recv,
+	rtt_sum = rtt_sum + excluded.rtt_sum,
+	rtt_min = CASE WHEN recv = 0 THEN excluded.rtt_min WHEN excluded.recv = 0 THEN rtt_min ELSE min(rtt_min, excluded.rtt_min) END,
+	rtt_max = max(rtt_max, excluded.rtt_max)`
+
+// PingRow is a stored ping bucket.
+type PingRow struct {
+	TargetID string
+	PingBucket
+}
+
+// QueryPing returns ping buckets of a node in [from, to), ordered by time.
+func (s *Store) QueryPing(nodeID string, res, from, to int64) ([]PingRow, error) {
+	rows, err := s.db.Query(`SELECT target_id, ts, sent, recv, rtt_sum, rtt_min, rtt_max FROM ping_metrics
+		WHERE node_id=? AND res=? AND ts>=? AND ts<? ORDER BY ts`, nodeID, res, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PingRow
+	for rows.Next() {
+		var r PingRow
+		if err := rows.Scan(&r.TargetID, &r.TS, &r.Sent, &r.Recv, &r.RTTSum, &r.RTTMin, &r.RTTMax); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// alert state (so restarts neither forget nor re-send alerts)
+
+func (s *Store) LoadAlerts() ([]Alert, error) {
+	rows, err := s.db.Query(`SELECT key, kind, node_id, target_id, since FROM alerts`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Alert
+	for rows.Next() {
+		var a Alert
+		if err := rows.Scan(&a.Key, &a.Kind, &a.NodeID, &a.TargetID, &a.Since); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) SaveAlert(a Alert) error {
+	_, err := s.db.Exec(`INSERT INTO alerts (key, kind, node_id, target_id, since) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT (key) DO UPDATE SET since=excluded.since`, a.Key, a.Kind, a.NodeID, a.TargetID, a.Since)
+	return err
+}
+
+func (s *Store) DeleteAlert(key string) error {
+	_, err := s.db.Exec(`DELETE FROM alerts WHERE key=?`, key)
 	return err
 }
 

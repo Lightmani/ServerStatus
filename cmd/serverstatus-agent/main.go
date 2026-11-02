@@ -22,6 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/Lightmani/ServerStatus/internal/collector"
+	"github.com/Lightmani/ServerStatus/internal/pinger"
 	"github.com/Lightmani/ServerStatus/internal/protocol"
 )
 
@@ -128,10 +129,12 @@ func run(ctx context.Context, cfg config, col *collector.Collector) {
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 
+	pg := pinger.New()
+	defer pg.Stop()
 	failures := 0
 	var skew time.Duration
 	for {
-		err := report(ctx, client, url, cfg, col, skew)
+		err := report(ctx, client, url, cfg, col, pg, skew)
 		var se *skewError
 		switch {
 		case err == nil:
@@ -163,8 +166,15 @@ type skewError struct{ serverTime int64 }
 
 func (e *skewError) Error() string { return "clock skew" }
 
-func report(ctx context.Context, client *http.Client, url string, cfg config, col *collector.Collector, skew time.Duration) error {
-	body, err := json.Marshal(col.Collect())
+func report(ctx context.Context, client *http.Client, url string, cfg config, col *collector.Collector, pg *pinger.Pinger, skew time.Duration) (err error) {
+	rep := col.Collect()
+	rep.Pings = pg.Take()
+	defer func() {
+		if err != nil {
+			pg.Restore(rep.Pings) // keep the probes for the next attempt
+		}
+	}()
+	body, err := json.Marshal(rep)
 	if err != nil {
 		return err
 	}
@@ -174,14 +184,18 @@ func report(ctx context.Context, client *http.Client, url string, cfg config, co
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "serverstatus-agent/"+version)
-	protocol.SignRequest(req, protocol.ReportPath, cfg.NodeID, cfg.Secret, body, time.Now().Add(skew))
+	ts, nonce := protocol.SignRequest(req, protocol.ReportPath, cfg.NodeID, cfg.Secret, body, time.Now().Add(skew))
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+	data, _ := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+	if resp.StatusCode == http.StatusNoContent {
+		return nil // older server without agent configuration
+	}
+	if resp.StatusCode == http.StatusOK {
+		applyConfig(pg, cfg, ts, nonce, data, resp.Header.Get(protocol.HeaderSignature))
 		return nil
 	}
 	var e struct {
@@ -198,4 +212,33 @@ func report(ctx context.Context, client *http.Client, url string, cfg config, co
 		e.Error = strings.TrimSpace(string(data))
 	}
 	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, e.Error)
+}
+
+var lastTargets string
+
+// applyConfig updates ping targets from a signed server response. Responses
+// with a bad signature are ignored, so a man in the middle cannot make the
+// agent probe arbitrary hosts.
+func applyConfig(pg *pinger.Pinger, cfg config, ts int64, nonce string, data []byte, sig string) {
+	if !protocol.VerifyResponse(cfg.Secret, cfg.NodeID, ts, nonce, data, sig) {
+		log.Printf("ignoring server response with invalid signature")
+		return
+	}
+	var rr protocol.ReportResponse
+	if err := json.Unmarshal(data, &rr); err != nil {
+		log.Printf("invalid server response: %v", err)
+		return
+	}
+	interval := time.Duration(rr.PingInterval) * time.Second
+	key := fmt.Sprintf("%v|%s", rr.PingTargets, interval)
+	if key == lastTargets {
+		return
+	}
+	lastTargets = key
+	names := make([]string, 0, len(rr.PingTargets))
+	for _, t := range rr.PingTargets {
+		names = append(names, t.Name+"="+t.Host)
+	}
+	log.Printf("ping targets (every %s): %s", interval, strings.Join(names, ", "))
+	pg.Update(rr.PingTargets, interval)
 }

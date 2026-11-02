@@ -68,9 +68,35 @@ type State struct {
 
 // Report is the body an agent sends on every interval.
 type Report struct {
-	Time  int64    `json:"time"` // agent clock, unix seconds
-	Host  HostInfo `json:"host"`
-	State State    `json:"state"`
+	Time  int64        `json:"time"` // agent clock, unix seconds
+	Host  HostInfo     `json:"host"`
+	State State        `json:"state"`
+	Pings []PingResult `json:"pings,omitempty"`
+}
+
+// PingTarget is a host the agent should probe, pushed by the server.
+// Host is "1.2.3.4", "example.com", "[2001:db8::1]" (ICMP echo) or
+// "tcp://host:port" (TCP connect time).
+type PingTarget struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Host string `json:"host"`
+}
+
+// PingResult aggregates the probes to one target since the previous report.
+type PingResult struct {
+	ID     string  `json:"id"`
+	Sent   int     `json:"sent"`
+	Recv   int     `json:"recv"`
+	RTTSum float64 `json:"rtt_sum"` // milliseconds, over received probes
+	RTTMin float64 `json:"rtt_min"`
+	RTTMax float64 `json:"rtt_max"`
+}
+
+// ReportResponse is returned by the server for every accepted report.
+type ReportResponse struct {
+	PingTargets  []PingTarget `json:"ping_targets"`
+	PingInterval int          `json:"ping_interval"` // seconds
 }
 
 // NewSecret returns a random 256-bit secret, base64url encoded.
@@ -121,13 +147,30 @@ func Sign(secret, method, path, node string, ts int64, nonce string, body []byte
 // SignRequest stamps the auth headers onto req. body must be the exact bytes
 // sent. path is the logical endpoint (e.g. ReportPath); it is signed instead
 // of req.URL.Path so the server may sit behind a reverse proxy sub-path.
-func SignRequest(req *http.Request, path, node, secret string, body []byte, now time.Time) {
+func SignRequest(req *http.Request, path, node, secret string, body []byte, now time.Time) (int64, string) {
 	ts := now.Unix()
 	nonce := NewNonce()
 	req.Header.Set(HeaderNode, node)
 	req.Header.Set(HeaderTimestamp, strconv.FormatInt(ts, 10))
 	req.Header.Set(HeaderNonce, nonce)
 	req.Header.Set(HeaderSignature, Sign(secret, req.Method, path, node, ts, nonce, body))
+	return ts, nonce
+}
+
+// responseMethod domain-separates response signatures from request signatures.
+const responseMethod = "RESPONSE"
+
+// SignResponse signs a server response bound to the request's timestamp and
+// nonce, so agents only accept configuration that really comes from the
+// server (and not a replayed older response).
+func SignResponse(secret, node string, ts int64, nonce string, body []byte) string {
+	return Sign(secret, responseMethod, ReportPath, node, ts, nonce, body)
+}
+
+// VerifyResponse checks a response signature produced by SignResponse.
+func VerifyResponse(secret, node string, ts int64, nonce string, body []byte, sig string) bool {
+	want := SignResponse(secret, node, ts, nonce, body)
+	return hmac.Equal([]byte(want), []byte(strings.ToLower(sig)))
 }
 
 // Signed holds the auth fields parsed from a request.

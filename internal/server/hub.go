@@ -18,7 +18,8 @@ type liveNode struct {
 	state    *protocol.State
 	lastSeen time.Time
 
-	cur *Bucket // current (unflushed) minute
+	cur   *Bucket               // current (unflushed) minute
+	pings map[string]*pingTrack // target id -> live ping state
 
 	haveCounters bool
 	lastRx       uint64
@@ -37,8 +38,9 @@ type Hub struct {
 	cfg   *Config
 	store *Store
 
-	mu    sync.RWMutex
-	nodes map[string]*liveNode
+	mu      sync.RWMutex
+	nodes   map[string]*liveNode
+	targets []PingTargetDef
 
 	writes chan writeMsg
 	wg     sync.WaitGroup
@@ -60,14 +62,20 @@ func (h *Hub) reload() error {
 	if err != nil {
 		return err
 	}
+	targets, err := h.store.ListPingTargets()
+	if err != nil {
+		return err
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.targets = targets
 	seen := make(map[string]bool, len(nodes))
 	for _, n := range nodes {
 		seen[n.ID] = true
 		ln, ok := h.nodes[n.ID]
 		if !ok {
 			ln = &liveNode{
+				pings:        map[string]*pingTrack{},
 				haveCounters: n.LastBoot != 0,
 				lastRx:       n.LastRx,
 				lastTx:       n.LastTx,
@@ -87,10 +95,25 @@ func (h *Hub) reload() error {
 			ln.cycleStart = 0 // force recompute
 		}
 		ln.meta = n
+		// forget state of targets that no longer apply to this node
+		for tid := range ln.pings {
+			if t := h.targetLocked(tid); t == nil || !t.AppliesTo(n.ID) {
+				delete(ln.pings, tid)
+			}
+		}
 	}
 	for id := range h.nodes {
 		if !seen[id] {
 			delete(h.nodes, id)
+		}
+	}
+	return nil
+}
+
+func (h *Hub) targetLocked(id string) *PingTargetDef {
+	for i := range h.targets {
+		if h.targets[i].ID == id {
+			return &h.targets[i]
 		}
 	}
 	return nil
@@ -105,6 +128,32 @@ func (h *Hub) Secret(id string) (string, bool) {
 		return "", false
 	}
 	return n.meta.Secret, true
+}
+
+// PingTargetsFor returns the targets a node should probe.
+func (h *Hub) PingTargetsFor(id string) []protocol.PingTarget {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := []protocol.PingTarget{}
+	for _, t := range h.targets {
+		if t.AppliesTo(id) {
+			out = append(out, protocol.PingTarget{ID: t.ID, Name: t.Name, Host: t.Host})
+		}
+	}
+	return out
+}
+
+// targetDefsFor returns the target definitions applying to a node.
+func (h *Hub) targetDefsFor(id string) []PingTargetDef {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	var out []PingTargetDef
+	for _, t := range h.targets {
+		if t.AppliesTo(id) {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // trafficDelta works out how many bytes were transferred since the last
@@ -127,6 +176,22 @@ func trafficDelta(have bool, lastBoot int64, lastRx, lastTx uint64, boot int64, 
 		dtx = tx - lastTx
 	}
 	return drx, dtx
+}
+
+// takeFlush packages the current minute (metrics + pings) and resets it.
+func (n *liveNode) takeFlush(id string) flushJob {
+	j := n.flushJob(id)
+	n.cur = nil
+	for tid, t := range n.pings {
+		if t.cur.Sent > 0 {
+			if j.Pings == nil {
+				j.Pings = map[string]PingBucket{}
+			}
+			j.Pings[tid] = t.cur
+		}
+		t.cur = PingBucket{}
+	}
+	return j
 }
 
 func (n *liveNode) flushJob(id string) flushJob {
@@ -160,8 +225,7 @@ func (h *Hub) Ingest(id string, rep *protocol.Report, now time.Time) error {
 	}
 	if n.cur != nil && n.cur.TS != minute {
 		// counters persisted with the job match what is inside it
-		job = append(job, n.flushJob(id))
-		n.cur = nil
+		job = append(job, n.takeFlush(id))
 	}
 	drx, dtx := trafficDelta(n.haveCounters, n.lastBoot, n.lastRx, n.lastTx,
 		rep.Host.BootTime, rep.State.NetRx, rep.State.NetTx)
@@ -173,6 +237,19 @@ func (h *Hub) Ingest(id string, rep *protocol.Report, now time.Time) error {
 	n.cur.Add(&st, drx, dtx)
 	n.state, n.host, n.lastSeen = &st, &host, now
 	n.haveCounters, n.lastRx, n.lastTx, n.lastBoot = true, st.NetRx, st.NetTx, host.BootTime
+	for i := range rep.Pings {
+		r := &rep.Pings[i]
+		t := h.targetLocked(r.ID)
+		if t == nil || !t.AppliesTo(id) || !sanitizePing(r) {
+			continue
+		}
+		tr := n.pings[r.ID]
+		if tr == nil {
+			tr = &pingTrack{}
+			n.pings[r.ID] = tr
+		}
+		tr.add(r, minute)
+	}
 	h.mu.Unlock()
 
 	if job != nil {
@@ -188,8 +265,7 @@ func (h *Hub) flushStale(now time.Time, all bool) []flushJob {
 	h.mu.Lock()
 	for id, n := range h.nodes {
 		if n.cur != nil && (all || n.cur.TS < minute) {
-			jobs = append(jobs, n.flushJob(id))
-			n.cur = nil
+			jobs = append(jobs, n.takeFlush(id))
 		}
 	}
 	h.mu.Unlock()
@@ -359,6 +435,7 @@ type NodeView struct {
 	Host     *protocol.HostInfo `json:"host"`
 	State    *protocol.State    `json:"state"`
 	Cycle    CycleView          `json:"cycle"`
+	Pings    []PingView         `json:"pings"`
 }
 
 // Snapshot returns all visible nodes in display order.
@@ -382,6 +459,17 @@ func (h *Hub) Snapshot(now time.Time, includeHidden bool) []NodeView {
 		if n.cur != nil && n.cur.TS >= n.cycleStart {
 			v.Cycle.Rx += n.cur.Rx
 			v.Cycle.Tx += n.cur.Tx
+		}
+		v.Pings = []PingView{}
+		for _, t := range h.targets {
+			if !t.AppliesTo(id) {
+				continue
+			}
+			pv := PingView{ID: t.ID, Name: t.Name, Host: t.Host}
+			if tr := n.pings[t.ID]; tr != nil && v.Online {
+				pv.Latency, pv.Loss, pv.Sent = tr.view(now)
+			}
+			v.Pings = append(v.Pings, pv)
 		}
 		out = append(out, v)
 	}
@@ -410,6 +498,49 @@ func (h *Hub) visibleMetas(includeHidden bool) []Node {
 		if !n.meta.Hidden || includeHidden {
 			out = append(out, n.meta)
 		}
+	}
+	return out
+}
+
+// alertInput is the per-node data the alerter needs.
+type alertInput struct {
+	ID, Name, Location string
+	Hidden, NoAlert    bool
+	LastSeen           time.Time
+	Online             bool
+	Targets            []targetAlertInput
+}
+
+type targetAlertInput struct {
+	ID, Name, Host string
+	AllLost        bool    // 100% loss in each of the last N minutes
+	Recovered      bool    // replies seen in the current or previous minute
+	Latency        float64 // ms, latest
+}
+
+func (h *Hub) alertInputs(now time.Time, lossMinutes int) []alertInput {
+	minute := now.Unix() - now.Unix()%60
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	out := make([]alertInput, 0, len(h.nodes))
+	for id, n := range h.nodes {
+		in := alertInput{ID: id, Name: n.meta.Name, Location: n.meta.Location, Hidden: n.meta.Hidden,
+			NoAlert: n.meta.NoAlert, LastSeen: n.lastSeen,
+			Online: !n.lastSeen.IsZero() && now.Sub(n.lastSeen) <= h.cfg.OfflineAfter}
+		for _, t := range h.targets {
+			if !t.AppliesTo(id) {
+				continue
+			}
+			ti := targetAlertInput{ID: t.ID, Name: t.Name, Host: t.Host}
+			if tr := n.pings[t.ID]; tr != nil {
+				ti.AllLost = tr.allLost(minute, lossMinutes)
+				w := tr.window(minute-60, minute+60)
+				ti.Recovered = w.Recv > 0
+				ti.Latency = tr.lastRTT
+			}
+			in.Targets = append(in.Targets, ti)
+		}
+		out = append(out, in)
 	}
 	return out
 }

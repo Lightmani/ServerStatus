@@ -24,6 +24,7 @@ import (
 
 	"golang.org/x/term"
 
+	"github.com/Lightmani/ServerStatus/internal/pinger"
 	"github.com/Lightmani/ServerStatus/internal/protocol"
 	"github.com/Lightmani/ServerStatus/internal/server"
 )
@@ -44,6 +45,10 @@ Commands:
   node edit ID [...]          change node properties
   node secret ID              rotate a node's secret
   node del ID                 delete a node and all its data
+  target add -name N -host H  add a ping target (ICMP host/IP or tcp://host:port)
+  target list|edit|del        manage ping targets
+  notify test                 send a test alert through Telegram
+  telegram chats              list chats that messaged the bot (to find chat_ids)
   passwd [-clear]             set (or remove) the dashboard password
   config-example              print an example configuration file
   version                     print version
@@ -95,6 +100,13 @@ func main() {
 	case "passwd":
 		err = passwdCmd(cfg, args)
 		fixOwnership(cfg.Database)
+	case "target":
+		err = targetCmd(cfg, args)
+		fixOwnership(cfg.Database)
+	case "notify":
+		err = notifyCmd(cfg, args)
+	case "telegram":
+		err = telegramCmd(cfg, args)
 	default:
 		fs.Usage()
 		os.Exit(2)
@@ -193,7 +205,7 @@ type nodeFlags struct {
 	fs                           *flag.FlagSet
 	name, group, location, limit *string
 	sort, resetDay               *int
-	hidden                       *bool
+	hidden, alert                *bool
 }
 
 func newNodeFlags(name string) *nodeFlags {
@@ -207,6 +219,7 @@ func newNodeFlags(name string) *nodeFlags {
 		sort:     fs.Int("sort", 0, "sort order (smaller first)"),
 		resetDay: fs.Int("reset-day", 1, "day of month the traffic cycle resets (1-31)"),
 		hidden:   fs.Bool("hidden", false, "hide from the public dashboard"),
+		alert:    fs.Bool("alert", true, "send alerts for this node (-alert=false to mute)"),
 	}
 }
 
@@ -227,6 +240,8 @@ func (f *nodeFlags) apply(n *server.Node) error {
 			n.ResetDay = *f.resetDay
 		case "hidden":
 			n.Hidden = *f.hidden
+		case "alert":
+			n.NoAlert = !*f.alert
 		case "limit":
 			n.TrafficLimit, err = parseSize(*f.limit)
 		}
@@ -291,20 +306,20 @@ func nodeCmd(cfg *server.Config, args []string) error {
 			return err
 		}
 		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tNAME\tGROUP\tLOCATION\tRESET\tLIMIT\tHIDDEN\tLAST SEEN")
+		fmt.Fprintln(tw, "ID\tNAME\tGROUP\tLOCATION\tRESET\tLIMIT\tHIDDEN\tALERT\tLAST SEEN")
 		for _, n := range nodes {
 			seen := "never"
 			if n.LastSeen > 0 {
 				seen = time.Unix(n.LastSeen, 0).In(cfg.Location()).Format("2006-01-02 15:04:05")
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%v\t%s\n", n.ID, n.Name, n.Group, n.Location, n.ResetDay, fmtSize(n.TrafficLimit), n.Hidden, seen)
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%v\t%v\t%s\n", n.ID, n.Name, n.Group, n.Location, n.ResetDay, fmtSize(n.TrafficLimit), n.Hidden, !n.NoAlert, seen)
 		}
 		tw.Flush()
 	case "edit", "set":
 		f := newNodeFlags("node edit")
 		id, err := parseInterspersed(f.fs, args)
 		if err != nil || id == "" {
-			return errors.New("usage: node edit ID [-name N] [-group G] [-location L] [-sort N] [-reset-day D] [-limit SIZE] [-hidden=true|false]")
+			return errors.New("usage: node edit ID [-name N] [-group G] [-location L] [-sort N] [-reset-day D] [-limit SIZE] [-hidden=true|false] [-alert=true|false]")
 		}
 		n, err := st.GetNode(id)
 		if err != nil {
@@ -443,5 +458,180 @@ func passwdCmd(cfg *server.Config, args []string) error {
 		return err
 	}
 	fmt.Println("Password set. The running server applies it within 10s.")
+	return nil
+}
+
+func targetCmd(cfg *server.Config, args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: target add|list|edit|del")
+	}
+	sub, args := args[0], args[1:]
+	st := openStore(cfg)
+	defer st.Close()
+
+	fs := flag.NewFlagSet("target "+sub, flag.ExitOnError)
+	name := fs.String("name", "", "display name, e.g. \"上海电信\"")
+	host := fs.String("host", "", "IP / hostname (ICMP ping) or tcp://host:port (TCP connect)")
+	nodes := fs.String("nodes", "", "comma-separated node IDs that probe it (empty = all nodes)")
+	sortN := fs.Int("sort", 0, "sort order")
+	id := fs.String("id", "", "target id (default: random)")
+
+	apply := func(t *server.PingTargetDef) error {
+		var err error
+		fs.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "name":
+				t.Name = *name
+			case "host":
+				t.Host = strings.TrimSpace(*host)
+			case "nodes":
+				t.Nodes = nil
+				for _, n := range strings.Split(*nodes, ",") {
+					if n = strings.TrimSpace(n); n != "" {
+						if _, e := st.GetNode(n); e != nil {
+							err = fmt.Errorf("unknown node %q", n)
+						}
+						t.Nodes = append(t.Nodes, n)
+					}
+				}
+			case "sort":
+				t.Sort = *sortN
+			}
+		})
+		if err != nil {
+			return err
+		}
+		if _, e := pinger.ParseTarget(t.Host); e != nil {
+			return e
+		}
+		return nil
+	}
+
+	switch sub {
+	case "add":
+		_ = fs.Parse(args)
+		t := server.PingTargetDef{ID: *id, CreatedAt: time.Now().Unix()}
+		if t.ID == "" {
+			t.ID = randomID()
+		}
+		if !idRe.MatchString(t.ID) {
+			return errors.New("invalid id")
+		}
+		if *host == "" {
+			return errors.New("-host is required")
+		}
+		if err := apply(&t); err != nil {
+			return err
+		}
+		if t.Name == "" {
+			t.Name = t.Host
+		}
+		if err := st.AddPingTarget(t); err != nil {
+			return err
+		}
+		fmt.Printf("Ping target %s (%s → %s) added; agents pick it up within ~10s.\n", t.ID, t.Name, t.Host)
+	case "list", "ls":
+		ts, err := st.ListPingTargets()
+		if err != nil {
+			return err
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tNAME\tHOST\tNODES\tSORT")
+		for _, t := range ts {
+			n := "all"
+			if len(t.Nodes) > 0 {
+				n = strings.Join(t.Nodes, ",")
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\n", t.ID, t.Name, t.Host, n, t.Sort)
+		}
+		tw.Flush()
+	case "edit", "set":
+		tid, err := parseInterspersed(fs, args)
+		if err != nil || tid == "" {
+			return errors.New("usage: target edit ID [-name N] [-host H] [-nodes a,b] [-sort N]")
+		}
+		t, err := st.GetPingTarget(tid)
+		if err != nil {
+			return err
+		}
+		if err := apply(&t); err != nil {
+			return err
+		}
+		if err := st.UpdatePingTarget(t); err != nil {
+			return err
+		}
+		fmt.Println("Ping target updated.")
+	case "del", "rm", "delete":
+		if len(args) != 1 {
+			return errors.New("usage: target del ID")
+		}
+		if err := st.DeletePingTarget(args[0]); err != nil {
+			return err
+		}
+		fmt.Println("Ping target and its history deleted.")
+	default:
+		return fmt.Errorf("unknown target command %q", sub)
+	}
+	return nil
+}
+
+func notifyCmd(cfg *server.Config, args []string) error {
+	if len(args) == 0 || args[0] != "test" {
+		return errors.New("usage: notify test")
+	}
+	tg, err := server.NewTelegram(cfg.Telegram)
+	if err != nil {
+		return err
+	}
+	if tg == nil {
+		return errors.New("telegram.bot_token is not set in the config")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	msg := "✅ <b>ServerStatus</b> 告警通道测试成功\n" + time.Now().In(cfg.Location()).Format("2006-01-02 15:04:05")
+	failed := 0
+	for _, chat := range tg.Chats() {
+		if err := tg.Send(ctx, chat, msg); err != nil {
+			failed++
+			fmt.Printf("chat %s: FAILED: %v\n", chat, err)
+		} else {
+			fmt.Printf("chat %s: ok\n", chat)
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d chat(s) failed", failed)
+	}
+	return nil
+}
+
+func telegramCmd(cfg *server.Config, args []string) error {
+	if len(args) == 0 || args[0] != "chats" {
+		return errors.New("usage: telegram chats")
+	}
+	tg, err := server.TelegramForSetup(cfg.Telegram)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	chats, err := tg.RecentChats(ctx)
+	if err != nil {
+		return err
+	}
+	if len(chats) == 0 {
+		fmt.Println("No chats found. Send any message to your bot (or add it to a group / channel), then run this again.")
+		return nil
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "CHAT_ID\tTYPE\tNAME")
+	for _, c := range chats {
+		name := c.Title
+		if name == "" {
+			name = strings.TrimSpace(c.First + " @" + c.User)
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\n", c.ID, c.Type, name)
+	}
+	tw.Flush()
+	fmt.Println("\nPut the wanted IDs into telegram.chat_ids in the server config.")
 	return nil
 }

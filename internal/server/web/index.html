@@ -21,6 +21,7 @@
 
 <main class="wrap">
   <section id="summary" class="summary"></section>
+  <section id="alerts" class="alerts"></section>
 
   <section id="view-nodes">
     <div class="toolbar">
@@ -89,6 +90,15 @@
       <div class="chart-card"><div class="chart-title" id="t-load"></div><div class="chart" id="c-load"></div></div>
       <div class="chart-card"><div class="chart-title" id="t-tcp"></div><div class="chart" id="c-tcp"></div></div>
       <div class="chart-card"><div class="chart-title" id="t-proc"></div><div class="chart" id="c-proc"></div></div>
+    </div>
+
+    <div id="d-ping" class="hidden">
+      <div class="section-title"><h3>定向监测</h3></div>
+      <div class="scroll-x"><table class="grid" id="d-ping-table"></table></div>
+      <div class="charts" style="margin-top:12px">
+        <div class="chart-card"><div class="chart-title" id="t-rtt"></div><div class="chart" id="c-rtt"></div></div>
+        <div class="chart-card"><div class="chart-title" id="t-loss"></div><div class="chart" id="c-loss"></div></div>
+      </div>
     </div>
 
     <div class="section-title">

@@ -45,3 +45,18 @@ func TestParseHeadersRejectsGarbage(t *testing.T) {
 		t.Fatal("expected error")
 	}
 }
+
+func TestResponseSignature(t *testing.T) {
+	body := []byte(`{"ping_targets":[]}`)
+	sig := SignResponse("k", "n", 100, "abcd", body)
+	if !VerifyResponse("k", "n", 100, "abcd", body, sig) {
+		t.Fatal("valid response rejected")
+	}
+	if VerifyResponse("k", "n", 100, "other", body, sig) || VerifyResponse("k", "n", 100, "abcd", []byte("{}"), sig) {
+		t.Fatal("mismatched response accepted")
+	}
+	// a request signature must never validate as a response signature
+	if VerifyResponse("k", "n", 100, "abcd", body, Sign("k", "POST", ReportPath, "n", 100, "abcd", body)) {
+		t.Fatal("request signature accepted as response")
+	}
+}
