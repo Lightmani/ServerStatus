@@ -1,0 +1,12 @@
+# ServerStatus agent configuration (/etc/serverstatus/agent.yaml)
+server: "https://status.example.com"   # server URL (HTTPS recommended)
+node_id: "hk01"                         # from `serverstatus-server node add`
+secret: "CHANGE_ME"                     # from `serverstatus-server node add`
+interval: 3s                            # report interval
+
+# Regex of network interfaces to ignore for traffic accounting.
+# Default skips lo, docker*, veth*, br-*, virbr*, cni*, flannel*, cali*, kube-*, lxc*...
+# nic_exclude: "^(lo|docker.*|veth.*)$"
+
+# Only for self-signed certificates during testing.
+# insecure_skip_verify: false

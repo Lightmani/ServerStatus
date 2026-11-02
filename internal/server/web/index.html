@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server Status</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%2322c55e'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="brand" href="#/"><span class="dot on"></span><span id="title">Server Status</span></a>
+    <nav class="tabs" id="nav">
+      <a href="#/" data-view="nodes">节点</a>
+      <a href="#/stats" data-view="stats">统计</a>
+    </nav>
+    <button class="btn ghost hidden" id="logout">退出</button>
+  </div>
+</header>
+
+<main class="wrap">
+  <section id="summary" class="summary"></section>
+  <section id="alerts" class="alerts"></section>
+
+  <section id="view-nodes">
+    <div class="toolbar">
+      <input id="filter" class="input" type="search" placeholder="搜索名称 / 分组 / 位置 / 系统">
+      <div class="seg" id="node-filter">
+        <button data-f="all" class="active">全部</button>
+        <button data-f="online">在线</button>
+        <button data-f="offline">离线</button>
+      </div>
+    </div>
+    <div class="table" id="nodes">
+      <div class="row head">
+        <div>节点</div><div>在线时长</div><div>负载</div><div>网络 ↓/↑</div><div>本周期流量 ↓/↑</div>
+        <div>CPU</div><div>内存</div><div>硬盘</div>
+      </div>
+      <div id="node-rows"></div>
+    </div>
+    <p class="empty hidden" id="no-nodes">暂无节点。在服务端执行 <code>serverstatus-server node add -name 节点名</code> 添加。</p>
+  </section>
+
+  <section id="view-stats" class="hidden">
+    <div class="toolbar">
+      <div class="seg" id="stats-period">
+        <button data-p="day">日</button>
+        <button data-p="week">周</button>
+        <button data-p="month" class="active">月</button>
+      </div>
+      <div class="pager">
+        <button class="btn" id="stats-prev">‹</button>
+        <span id="stats-label" class="pager-label"></span>
+        <button class="btn" id="stats-next">›</button>
+      </div>
+      <button class="btn" id="stats-csv">导出 CSV</button>
+    </div>
+    <div class="scroll-x"><table class="grid" id="stats-table"></table></div>
+  </section>
+</main>
+
+<div class="modal hidden" id="detail" role="dialog" aria-modal="true">
+  <div class="modal-body">
+    <div class="detail-head">
+      <div>
+        <h2 id="d-name"></h2>
+        <div class="muted" id="d-sub"></div>
+      </div>
+      <button class="btn ghost close" id="d-close" aria-label="关闭">✕</button>
+    </div>
+    <div class="info" id="d-info"></div>
+
+    <div class="section-title">
+      <h3>历史趋势</h3>
+      <div class="seg" id="d-range">
+        <button data-r="1h">1小时</button>
+        <button data-r="6h">6小时</button>
+        <button data-r="24h" class="active">24小时</button>
+        <button data-r="7d">7天</button>
+        <button data-r="30d">30天</button>
+        <button data-r="90d">90天</button>
+        <button data-r="1y">1年</button>
+      </div>
+    </div>
+    <div class="charts">
+      <div class="chart-card"><div class="chart-title" id="t-cpu"></div><div class="chart" id="c-cpu"></div></div>
+      <div class="chart-card"><div class="chart-title" id="t-mem"></div><div class="chart" id="c-mem"></div></div>
+      <div class="chart-card"><div class="chart-title" id="t-net"></div><div class="chart" id="c-net"></div></div>
+      <div class="chart-card"><div class="chart-title" id="t-load"></div><div class="chart" id="c-load"></div></div>
+      <div class="chart-card"><div class="chart-title" id="t-tcp"></div><div class="chart" id="c-tcp"></div></div>
+      <div class="chart-card"><div class="chart-title" id="t-proc"></div><div class="chart" id="c-proc"></div></div>
+    </div>
+
+    <div id="d-ping" class="hidden">
+      <div class="section-title"><h3>定向监测</h3></div>
+      <div class="scroll-x"><table class="grid" id="d-ping-table"></table></div>
+      <div class="charts" style="margin-top:12px">
+        <div class="chart-card"><div class="chart-title" id="t-rtt"></div><div class="chart" id="c-rtt"></div></div>
+        <div class="chart-card"><div class="chart-title" id="t-loss"></div><div class="chart" id="c-loss"></div></div>
+      </div>
+    </div>
+
+    <div class="section-title">
+      <h3>周期统计</h3>
+      <div class="seg" id="d-period">
+        <button data-p="day" class="active">按日</button>
+        <button data-p="week">按周</button>
+        <button data-p="month">按月</button>
+      </div>
+    </div>
+    <div class="scroll-x"><table class="grid" id="d-stats"></table></div>
+  </div>
+</div>
+
+<div class="modal hidden" id="login" role="dialog" aria-modal="true">
+  <form class="login-box" id="login-form">
+    <h2>登录</h2>
+    <p class="muted">此探针已设置访问密码</p>
+    <input class="input" type="password" id="login-pw" placeholder="密码" autocomplete="current-password" required>
+    <div class="error" id="login-err"></div>
+    <button class="btn primary" type="submit">登录</button>
+  </form>
+</div>
+
+<div class="tooltip hidden" id="tooltip"></div>
+<footer class="wrap footer muted" id="footer"></footer>
+<script src="app.js"></script>
+</body>
+</html>
