@@ -41,6 +41,8 @@ type Hub struct {
 	mu      sync.RWMutex
 	nodes   map[string]*liveNode
 	targets []PingTargetDef
+	// baselines: node\x00target -> typical RTT in ms (set by the alerter)
+	baselines map[string]float64
 
 	writes chan writeMsg
 	wg     sync.WaitGroup
@@ -466,6 +468,10 @@ func (h *Hub) Snapshot(now time.Time, includeHidden bool) []NodeView {
 				continue
 			}
 			pv := PingView{ID: t.ID, Name: t.Name, Host: t.Host}
+			if b, ok := h.baselines[baselineKey(id, t.ID)]; ok {
+				v := r2(b)
+				pv.Baseline = &v
+			}
 			if tr := n.pings[t.ID]; tr != nil && v.Online {
 				pv.Latency, pv.Loss, pv.Sent = tr.view(now)
 			}
@@ -516,9 +522,21 @@ type targetAlertInput struct {
 	AllLost        bool    // 100% loss in each of the last N minutes
 	Recovered      bool    // replies seen in the current or previous minute
 	Latency        float64 // ms, latest
+	// degradation window
+	Win      PingBucket
+	Covered  bool    // every minute of the window has data
+	LastLost bool    // latest complete minute fully lost
+	Baseline float64 // ms, 0 = unknown
 }
 
-func (h *Hub) alertInputs(now time.Time, lossMinutes int) []alertInput {
+// setBaselines replaces the latency baselines.
+func (h *Hub) setBaselines(b map[string]float64) {
+	h.mu.Lock()
+	h.baselines = b
+	h.mu.Unlock()
+}
+
+func (h *Hub) alertInputs(now time.Time, lossMinutes, degradeMinutes int) []alertInput {
 	minute := now.Unix() - now.Unix()%60
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -531,12 +549,13 @@ func (h *Hub) alertInputs(now time.Time, lossMinutes int) []alertInput {
 			if !t.AppliesTo(id) {
 				continue
 			}
-			ti := targetAlertInput{ID: t.ID, Name: t.Name, Host: t.Host}
+			ti := targetAlertInput{ID: t.ID, Name: t.Name, Host: t.Host, Baseline: h.baselines[baselineKey(id, t.ID)]}
 			if tr := n.pings[t.ID]; tr != nil {
 				ti.AllLost = tr.allLost(minute, lossMinutes)
 				w := tr.window(minute-60, minute+60)
 				ti.Recovered = w.Recv > 0
 				ti.Latency = tr.lastRTT
+				ti.Win, ti.Covered, ti.LastLost = tr.windowStats(minute, degradeMinutes)
 			}
 			in.Targets = append(in.Targets, ti)
 		}

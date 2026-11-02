@@ -446,10 +446,24 @@ func sortViews(v []NodeView) {
 
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, hidden bool) {
 	now := time.Now()
+	alerts := s.alerter.Active(hidden)
+	// mark targets with a firing alert (an outage outranks degradation)
+	firing := map[string]string{}
+	for _, al := range alerts {
+		if k := al.NodeID + "\x00" + al.TargetID; al.TargetID != "" && firing[k] != AlertPingLoss {
+			firing[k] = al.Kind
+		}
+	}
+	nodes := s.hub.Snapshot(now, hidden)
+	for i := range nodes {
+		for j := range nodes[i].Pings {
+			nodes[i].Pings[j].Alert = firing[nodes[i].ID+"\x00"+nodes[i].Pings[j].ID]
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"now":    now.Unix(),
-		"nodes":  s.hub.Snapshot(now, hidden),
-		"alerts": s.alerter.Active(hidden),
+		"nodes":  nodes,
+		"alerts": alerts,
 	})
 }
 

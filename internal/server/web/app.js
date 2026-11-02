@@ -106,6 +106,8 @@ function bar(p, label, title) {
 }
 
 function pingClass(p) {
+  if (p.alert === 'ping_loss') return 'bad';
+  if (p.alert === 'ping_degrade') return 'warn';
   if (p.loss == null) return 'idle';
   if (p.loss >= 100) return 'bad';
   if (p.loss >= 10 || (p.latency ?? 0) >= 300) return 'warn';
@@ -196,8 +198,10 @@ function renderAlerts() {
   $('#alerts').innerHTML = S.alerts.map((a) => {
     const what = a.kind === 'offline'
       ? `<b>${esc(a.node_name)}</b> 失联`
-      : `<b>${esc(a.node_name)}</b> → <b>${esc(a.target_name)}</b> 丢包 100%`;
-    return `<a class="alert" href="#/node/${encodeURIComponent(a.node_id)}"><span class="dot"></span>${what}<span class="sub">持续 ${fmtDur(now - a.since)} · 自 ${fmtTime(a.since)}</span></a>`;
+      : a.kind === 'ping_degrade'
+        ? `<b>${esc(a.node_name)}</b> → <b>${esc(a.target_name)}</b> 线路劣化 <span class="sub">${esc(a.detail || '')}</span>`
+        : `<b>${esc(a.node_name)}</b> → <b>${esc(a.target_name)}</b> 丢包 100%`;
+    return `<a class="alert ${a.kind === 'ping_degrade' ? 'warn' : ''}" href="#/node/${encodeURIComponent(a.node_id)}"><span class="dot"></span>${what}<span class="sub">持续 ${fmtDur(now - a.since)} · 自 ${fmtTime(a.since)}</span></a>`;
   }).join('');
 }
 
@@ -350,8 +354,10 @@ function renderPingTable(n) {
   const el = $('#d-ping-table');
   if (!n.pings || !n.pings.length) { el.innerHTML = ''; return; }
   const rows = n.pings.map((p) => `<tr><td><span class="chip ${pingClass(p)}">${esc(p.name)}</span></td><td>${esc(p.host)}</td>
-    <td>${p.latency == null ? '-' : p.latency.toFixed(1) + ' ms'}</td><td>${p.loss == null ? '-' : fmtPct(p.loss)}</td><td>${p.sent || '-'}</td></tr>`).join('');
-  el.innerHTML = `<thead><tr><th>目标</th><th>地址</th><th>实时延迟</th><th>丢包率 (近 1-2 分钟)</th><th>探测次数</th></tr></thead><tbody>${rows}</tbody>`;
+    <td>${p.latency == null ? '-' : p.latency.toFixed(1) + ' ms'}</td><td>${p.baseline == null ? '<span class="sub">积累中</span>' : p.baseline.toFixed(1) + ' ms'}</td>
+    <td>${p.loss == null ? '-' : fmtPct(p.loss)}</td><td>${p.sent || '-'}</td>
+    <td>${p.alert === 'ping_loss' ? '<span style="color:var(--bad)">中断</span>' : p.alert === 'ping_degrade' ? '<span style="color:var(--warn)">劣化</span>' : '<span class="sub">正常</span>'}</td></tr>`).join('');
+  el.innerHTML = `<thead><tr><th>目标</th><th>地址</th><th>实时延迟</th><th>基线延迟 (7 天中位数)</th><th>丢包率 (近 1-2 分钟)</th><th>探测次数</th><th>状态</th></tr></thead><tbody>${rows}</tbody>`;
 }
 
 function drawHistory() {

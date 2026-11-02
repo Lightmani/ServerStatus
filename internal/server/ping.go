@@ -132,12 +132,14 @@ func (t *pingTrack) allLost(minute int64, minutes int) bool {
 
 // PingView is the live status of one target as seen from one node.
 type PingView struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Host    string   `json:"host"`
-	Latency *float64 `json:"latency"` // ms, latest report
-	Loss    *float64 `json:"loss"`    // %, current + previous minute
-	Sent    int64    `json:"sent"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Host     string   `json:"host"`
+	Latency  *float64 `json:"latency"` // ms, latest report
+	Loss     *float64 `json:"loss"`    // %, current + previous minute
+	Sent     int64    `json:"sent"`
+	Baseline *float64 `json:"baseline"`        // ms, typical latency
+	Alert    string   `json:"alert,omitempty"` // "ping_loss" / "ping_degrade" when firing
 }
 
 func (t *pingTrack) view(now time.Time) (lat, loss *float64, sent int64) {
@@ -210,4 +212,81 @@ func buildPingHistory(rows []PingRow, targets []PingTargetDef, step int64, loc *
 		h.Targets = append(h.Targets, line)
 	}
 	return h
+}
+
+// windowStats merges the `minutes` complete minutes before `minute`.
+// covered is true when every one of them has probe data (the agent was
+// online throughout); lastLost reports that the most recent complete minute
+// had probes but no replies at all (a possible outage in progress).
+func (t *pingTrack) windowStats(minute int64, minutes int) (w PingBucket, covered, lastLost bool) {
+	byTS := make(map[int64]*PingBucket, len(t.recent))
+	for i := range t.recent {
+		byTS[t.recent[i].TS] = &t.recent[i]
+	}
+	covered = minutes > 0
+	for m := minute - int64(minutes)*60; m < minute; m += 60 {
+		b := byTS[m]
+		if b == nil || b.Sent == 0 {
+			covered = false
+			continue
+		}
+		w.Merge(b)
+	}
+	if b := byTS[minute-60]; b != nil && b.Sent > 0 && b.Recv == 0 {
+		lastLost = true
+	}
+	return w, covered, lastLost
+}
+
+func baselineKey(node, target string) string { return node + "\x00" + target }
+
+// computeBaselines returns, per (node, target), the median of hourly average
+// RTTs. Hours with more than 50% loss are ignored, and pairs with fewer than
+// minHours usable hours get no baseline. The median keeps past incidents
+// from inflating the baseline.
+func computeBaselines(rows []PingRowNode, minHours int) map[string]float64 {
+	samples := map[string][]float64{}
+	for _, r := range rows {
+		if r.Recv == 0 || r.Recv*2 < r.Sent {
+			continue
+		}
+		k := baselineKey(r.NodeID, r.TargetID)
+		samples[k] = append(samples[k], r.RTTSum/float64(r.Recv))
+	}
+	out := map[string]float64{}
+	for k, v := range samples {
+		if len(v) < minHours {
+			continue
+		}
+		sort.Float64s(v)
+		m := v[len(v)/2]
+		if len(v)%2 == 0 {
+			m = (v[len(v)/2-1] + v[len(v)/2]) / 2
+		}
+		out[k] = m
+	}
+	return out
+}
+
+// latencyThreshold returns the alert threshold in ms (0 = not evaluable).
+// factor scales the thresholds (1 to fire, <1 for the recovery hysteresis).
+func latencyThreshold(d *DegradeConfig, baseline, factor float64) float64 {
+	th := 0.0
+	if baseline > 0 {
+		th = max(baseline*d.LatencyFactor, baseline+d.LatencyMinIncreaseMs)
+		th = baseline + (th-baseline)*factor
+	}
+	if d.LatencyAbsMs > 0 {
+		abs := d.LatencyAbsMs * factor
+		if th == 0 || abs < th {
+			th = abs
+		}
+	}
+	return th
+}
+
+// PingRowNode is a stored ping bucket including its node.
+type PingRowNode struct {
+	NodeID string
+	PingRow
 }

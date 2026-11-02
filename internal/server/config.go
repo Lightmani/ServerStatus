@@ -34,6 +34,7 @@ type Config struct {
 		OfflineAfter    time.Duration `yaml:"offline_after"`
 		PingLossMinutes int           `yaml:"ping_loss_minutes"`
 		NotifyRecovery  bool          `yaml:"notify_recovery"`
+		Degrade         DegradeConfig `yaml:"degrade"`
 	} `yaml:"alert"`
 	Telegram TelegramConfig `yaml:"telegram"`
 
@@ -57,6 +58,15 @@ func DefaultConfig() *Config {
 	c.Alert.OfflineAfter = 5 * time.Minute
 	c.Alert.PingLossMinutes = 10
 	c.Alert.NotifyRecovery = true
+	c.Alert.Degrade = DegradeConfig{
+		Enabled:              true,
+		WindowMinutes:        10,
+		LossPercent:          20,
+		LatencyFactor:        2,
+		LatencyMinIncreaseMs: 50,
+		BaselineDays:         7,
+		BaselineMinHours:     24,
+	}
 	c.Telegram.APIBase = "https://api.telegram.org"
 	return c
 }
@@ -130,6 +140,9 @@ func (c *Config) validate() error {
 	if c.Alert.PingLossMinutes < 1 || c.Alert.PingLossMinutes > pingKeepMinutes-1 {
 		return fmt.Errorf("alert.ping_loss_minutes must be between 1 and %d", pingKeepMinutes-1)
 	}
+	if err := c.Alert.Degrade.validate(); err != nil {
+		return err
+	}
 	if c.Telegram.APIBase == "" {
 		c.Telegram.APIBase = "https://api.telegram.org"
 	}
@@ -178,6 +191,15 @@ alert:
   offline_after: 5m                  # alert when an agent has not reported for this long
   ping_loss_minutes: 10              # alert when a target lost 100% in each of the last N minutes
   notify_recovery: true              # also notify when the problem is resolved
+  degrade:                           # quality degradation (partial loss / abnormal latency)
+    enabled: true
+    window_minutes: 10               # evaluated over the last N complete minutes
+    loss_percent: 20                 # alert when average loss exceeds this (recovers below half)
+    latency_factor: 2                # abnormal latency: avg > baseline x factor ...
+    latency_min_increase_ms: 50      # ... and at least this many ms above the baseline
+    latency_abs_ms: 0                # optional absolute ceiling in ms (0 = off)
+    baseline_days: 7                 # baseline = median hourly latency over these days
+    baseline_min_hours: 24           # hours of history needed before latency alerts start
 
 telegram:
   bot_token: ""                      # from @BotFather; empty = notifications disabled
@@ -185,3 +207,31 @@ telegram:
   api_base: "https://api.telegram.org"   # or your own reverse proxy of the Bot API
   proxy: ""                          # e.g. socks5://127.0.0.1:1080 or http://127.0.0.1:8080
 `
+
+// DegradeConfig configures line-quality degradation alerts.
+type DegradeConfig struct {
+	Enabled              bool    `yaml:"enabled"`
+	WindowMinutes        int     `yaml:"window_minutes"`
+	LossPercent          float64 `yaml:"loss_percent"`
+	LatencyFactor        float64 `yaml:"latency_factor"`
+	LatencyMinIncreaseMs float64 `yaml:"latency_min_increase_ms"`
+	LatencyAbsMs         float64 `yaml:"latency_abs_ms"`
+	BaselineDays         int     `yaml:"baseline_days"`
+	BaselineMinHours     int     `yaml:"baseline_min_hours"`
+}
+
+func (d *DegradeConfig) validate() error {
+	switch {
+	case d.WindowMinutes < 2 || d.WindowMinutes > pingKeepMinutes-1:
+		return fmt.Errorf("alert.degrade.window_minutes must be between 2 and %d", pingKeepMinutes-1)
+	case d.LossPercent <= 0 || d.LossPercent >= 100:
+		return fmt.Errorf("alert.degrade.loss_percent must be between 0 and 100")
+	case d.LatencyFactor < 1:
+		return fmt.Errorf("alert.degrade.latency_factor must be >= 1")
+	case d.LatencyMinIncreaseMs < 0 || d.LatencyAbsMs < 0:
+		return fmt.Errorf("alert.degrade latency thresholds must not be negative")
+	case d.BaselineDays < 1 || d.BaselineMinHours < 1:
+		return fmt.Errorf("alert.degrade.baseline_days and baseline_min_hours must be >= 1")
+	}
+	return nil
+}

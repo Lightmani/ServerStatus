@@ -566,6 +566,25 @@ func (s *Store) QueryPing(nodeID string, res, from, to int64) ([]PingRow, error)
 	return out, rows.Err()
 }
 
+// QueryPingAll returns ping buckets of all nodes in [from, to).
+func (s *Store) QueryPingAll(res, from, to int64) ([]PingRowNode, error) {
+	rows, err := s.db.Query(`SELECT node_id, target_id, ts, sent, recv, rtt_sum, rtt_min, rtt_max FROM ping_metrics
+		WHERE res=? AND ts>=? AND ts<?`, res, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PingRowNode
+	for rows.Next() {
+		var r PingRowNode
+		if err := rows.Scan(&r.NodeID, &r.TargetID, &r.TS, &r.Sent, &r.Recv, &r.RTTSum, &r.RTTMin, &r.RTTMax); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ---------------------------------------------------------------------------
 // alert state (so restarts neither forget nor re-send alerts)
 
